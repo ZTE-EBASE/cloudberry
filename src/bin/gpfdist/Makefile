@@ -20,6 +20,16 @@ ifeq ($(have_yaml),yes)
   endif
 endif
 
+ifeq ($(with_liblzo2),yes)
+  LIBS += -llzo2
+  override CPPFLAGS := -DHAVE_LIBLZO2 $(CPPFLAGS)
+endif
+
+ifeq ($(with_libhdfs3),yes)
+  LIBS += -lhdfs3
+  override CPPFLAGS := -DUSE_LIBHDFS3 $(CPPFLAGS)
+endif
+
 ifeq ($(PORTNAME),win32)
   override CPPFLAGS := -I$(top_builddir)/src/port $(CPPFLAGS)
   OBJS += $(top_builddir)/src/port/glob.o

@@ -371,6 +371,9 @@
 /* Define to 1 if you have the `bz2' library (-lbz2). */
 #undef HAVE_LIBBZ2
 
+/* Define to 1 if you have the lzo2 library. */
+#undef HAVE_LIBLZO2
+
 /* Define to 1 if you have the `crypto' library (-lcrypto). */
 #undef HAVE_LIBCRYPTO
 
@@ -1089,6 +1092,9 @@
 
 /* Define to build with zstd support. (--with-zstd) */
 #undef USE_ZSTD
+
+/* Define to build with libhdfs3 support. (--with-libhdfs3) */
+#undef USE_LIBHDFS3
 
 /* Define to 1 if `wcstombs_l' requires <xlocale.h>. */
 #undef WCSTOMBS_L_IN_XLOCALE

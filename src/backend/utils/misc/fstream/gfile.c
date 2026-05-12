@@ -78,9 +78,20 @@ read_and_retry(gfile_t *fd, void *ptr, size_t size)
 {
 	ssize_t i = 0;
 
-	do
-		i = read(fd->fd.filefd, ptr, size);
-	while (i<0 && errno==EINTR);
+#ifdef USE_LIBHDFS3
+	if (fd->is_hdfs)
+	{
+		do
+			i = (ssize_t)hdfsRead(fd->hdfs_fs, fd->hdfs_file, ptr, (tSize)size);
+		while (i < 0 && errno == EINTR);
+	}
+	else
+#endif
+	{
+		do
+			i = read(fd->fd.filefd, ptr, size);
+		while (i<0 && errno==EINTR);
+	}
 
 	if (i > 0)
 		fd->compressed_position += i;
@@ -785,6 +796,359 @@ zstd_file_open(gfile_t *fd)
 	return 0;
 }
 #endif
+#ifdef HAVE_LIBLZO2
+/* LZO / LZOP */
+
+#define LZO_BLOCK_SIZE         (256 * 1024)
+#define LZO_OUTPUT_BUFFER_SIZE (LZO_BLOCK_SIZE + LZO_BLOCK_SIZE / 16 + 64 + 3)
+#define LZOP_MAGIC_LEN         9
+
+static const unsigned char lzop_magic[LZOP_MAGIC_LEN] = {
+	0x89, 0x4c, 0x5a, 0x4f, 0x00, 0x0d, 0x0a, 0x1a, 0x0a
+};
+
+/* LZOP flag bits */
+#define F_ADLER32_D   0x00000001
+#define F_ADLER32_C   0x00000002
+#define F_CRC32_D     0x00000100
+#define F_CRC32_C     0x00000200
+#define F_H_EXTRA_FIELD 0x00000040
+#define F_H_FILTER    0x00000800
+
+struct lzolib_stuff
+{
+	int            header_done;
+	uint32_t       flags;
+	int            eof;
+	unsigned char *out_buf;
+	lzo_uint       out_len;
+	lzo_uint       out_pos;
+	unsigned char *block_buf;
+	int            block_buf_alloc;
+};
+
+static uint32_t
+lzo_read_uint32_be(const unsigned char *p)
+{
+	return ((uint32_t)p[0] << 24) |
+		   ((uint32_t)p[1] << 16) |
+		   ((uint32_t)p[2] << 8)  |
+		   ((uint32_t)p[3]);
+}
+
+static uint16_t
+lzo_read_uint16_be(const unsigned char *p)
+{
+	return ((uint16_t)p[0] << 8) | (uint16_t)p[1];
+}
+
+static int
+lzo_read_exact(gfile_t *fd, void *buf, size_t len)
+{
+	size_t total = 0;
+
+	while (total < len)
+	{
+		ssize_t n = read_and_retry(fd, (unsigned char *)buf + total, len - total);
+		if (n < 0)
+			return -1;
+		if (n == 0)
+			return (total == 0) ? 0 : -1;
+		total += n;
+	}
+	return (int)total;
+}
+
+static int
+lzo_skip_bytes(gfile_t *fd, size_t len)
+{
+	unsigned char skip_buf[256];
+
+	while (len > 0)
+	{
+		size_t chunk = (len > sizeof(skip_buf)) ? sizeof(skip_buf) : len;
+		if (lzo_read_exact(fd, skip_buf, chunk) <= 0)
+			return -1;
+		len -= chunk;
+	}
+	return 0;
+}
+
+static int
+lzo_parse_header(gfile_t *fd, struct lzolib_stuff *lzo)
+{
+	unsigned char hdr[64];
+	uint16_t version;
+	uint8_t fname_len;
+	int n;
+
+	n = lzo_read_exact(fd, hdr, LZOP_MAGIC_LEN);
+	if (n <= 0)
+		return -1;
+	if (memcmp(hdr, lzop_magic, LZOP_MAGIC_LEN) != 0)
+	{
+		gfile_printf_then_putc_newline("LZO: invalid LZOP magic");
+		return -1;
+	}
+
+	/* version (2) + lib_version (2) */
+	if (lzo_read_exact(fd, hdr, 4) <= 0)
+		return -1;
+	version = lzo_read_uint16_be(hdr);
+
+	/* version_needed (2) if version >= 0x0940 */
+	if (version >= 0x0940)
+	{
+		if (lzo_read_exact(fd, hdr, 2) <= 0)
+			return -1;
+	}
+
+	/* method (1) */
+	if (lzo_read_exact(fd, hdr, 1) <= 0)
+		return -1;
+
+	/* level (1) if version >= 0x0940 */
+	if (version >= 0x0940)
+	{
+		if (lzo_read_exact(fd, hdr, 1) <= 0)
+			return -1;
+	}
+
+	/* flags (4) */
+	if (lzo_read_exact(fd, hdr, 4) <= 0)
+		return -1;
+	lzo->flags = lzo_read_uint32_be(hdr);
+
+	/* filter (4) if F_H_FILTER */
+	if (lzo->flags & F_H_FILTER)
+	{
+		if (lzo_read_exact(fd, hdr, 4) <= 0)
+			return -1;
+	}
+
+	/* mode (4) + mtime_low (4) */
+	if (lzo_read_exact(fd, hdr, 8) <= 0)
+		return -1;
+
+	/* mtime_high (4) if version >= 0x0940 */
+	if (version >= 0x0940)
+	{
+		if (lzo_read_exact(fd, hdr, 4) <= 0)
+			return -1;
+	}
+
+	/* filename length (1) + filename */
+	if (lzo_read_exact(fd, &fname_len, 1) <= 0)
+		return -1;
+	if (fname_len > 0)
+	{
+		if (lzo_skip_bytes(fd, fname_len) < 0)
+			return -1;
+	}
+
+	/* header checksum (4) */
+	if (lzo_read_exact(fd, hdr, 4) <= 0)
+		return -1;
+
+	/* extra field if F_H_EXTRA_FIELD */
+	if (lzo->flags & F_H_EXTRA_FIELD)
+	{
+		if (lzo_read_exact(fd, hdr, 4) <= 0)
+			return -1;
+		uint32_t extra_len = lzo_read_uint32_be(hdr);
+		if (lzo_skip_bytes(fd, extra_len) < 0)
+			return -1;
+		/* extra field checksum (4) */
+		if (lzo_read_exact(fd, hdr, 4) <= 0)
+			return -1;
+	}
+
+	lzo->header_done = 1;
+	return 0;
+}
+
+static int
+lzo_decompress_next_block(gfile_t *fd, struct lzolib_stuff *lzo)
+{
+	unsigned char blkhdr[8];
+	uint32_t usize, csize;
+	int checksums = 0;
+	int n;
+
+	n = lzo_read_exact(fd, blkhdr, 4);
+	if (n <= 0)
+	{
+		lzo->eof = 1;
+		return 0;
+	}
+	usize = lzo_read_uint32_be(blkhdr);
+	if (usize == 0)
+	{
+		lzo->eof = 1;
+		return 0;
+	}
+
+	if (lzo_read_exact(fd, blkhdr, 4) <= 0)
+		return -1;
+	csize = lzo_read_uint32_be(blkhdr);
+
+	/* skip uncompressed data checksum */
+	if (lzo->flags & (F_ADLER32_D | F_CRC32_D))
+	{
+		checksums = ((lzo->flags & F_ADLER32_D) ? 4 : 0) +
+					((lzo->flags & F_CRC32_D) ? 4 : 0);
+		if (lzo_skip_bytes(fd, checksums) < 0)
+			return -1;
+	}
+
+	/* skip compressed data checksum (only when data is actually compressed) */
+	if (csize < usize)
+	{
+		checksums = ((lzo->flags & F_ADLER32_C) ? 4 : 0) +
+					((lzo->flags & F_CRC32_C) ? 4 : 0);
+		if (checksums > 0)
+		{
+			if (lzo_skip_bytes(fd, checksums) < 0)
+				return -1;
+		}
+	}
+
+	/* ensure block buffer is large enough */
+	if ((int)csize > lzo->block_buf_alloc)
+	{
+		if (lzo->block_buf)
+			gfile_free(lzo->block_buf);
+		lzo->block_buf_alloc = csize + 1024;
+		lzo->block_buf = gfile_malloc(lzo->block_buf_alloc);
+		if (!lzo->block_buf)
+		{
+			gfile_printf_then_putc_newline("LZO: out of memory for block buffer");
+			return -1;
+		}
+	}
+
+	/* ensure output buffer is large enough */
+	if (usize > LZO_OUTPUT_BUFFER_SIZE)
+	{
+		gfile_free(lzo->out_buf);
+		lzo->out_buf = gfile_malloc(usize);
+		if (!lzo->out_buf)
+		{
+			gfile_printf_then_putc_newline("LZO: out of memory for output buffer");
+			return -1;
+		}
+	}
+
+	/* read the compressed (or stored) data */
+	if (lzo_read_exact(fd, lzo->block_buf, csize) <= 0)
+	{
+		gfile_printf_then_putc_newline("LZO: failed to read block data");
+		return -1;
+	}
+
+	if (csize == usize)
+	{
+		/* data is stored uncompressed */
+		memcpy(lzo->out_buf, lzo->block_buf, usize);
+		lzo->out_len = usize;
+	}
+	else
+	{
+		lzo_uint dst_len = usize;
+		int rc = lzo1x_decompress_safe(lzo->block_buf, csize,
+									   lzo->out_buf, &dst_len, NULL);
+		if (rc != LZO_E_OK)
+		{
+			gfile_printf_then_putc_newline("LZO: decompression failed (error %d)", rc);
+			return -1;
+		}
+		lzo->out_len = dst_len;
+	}
+
+	lzo->out_pos = 0;
+	return 1;
+}
+
+static ssize_t
+lzo_file_read(gfile_t *fd, void *ptr, size_t len)
+{
+	struct lzolib_stuff *lzo = fd->u.lzo;
+
+	if (!lzo->header_done)
+	{
+		if (lzo_parse_header(fd, lzo) < 0)
+			return -1;
+	}
+
+	for (;;)
+	{
+		lzo_uint avail = lzo->out_len - lzo->out_pos;
+
+		if (avail > 0 || lzo->eof)
+		{
+			if (avail > len)
+				avail = len;
+			if (avail > 0)
+				memcpy(ptr, lzo->out_buf + lzo->out_pos, avail);
+			lzo->out_pos += avail;
+			return (ssize_t)avail;
+		}
+
+		int rc = lzo_decompress_next_block(fd, lzo);
+		if (rc < 0)
+			return -1;
+		if (rc == 0 && lzo->eof)
+			return 0;
+	}
+}
+
+static int
+lzo_file_close(gfile_t *fd)
+{
+	struct lzolib_stuff *lzo = fd->u.lzo;
+
+	if (lzo)
+	{
+		if (lzo->out_buf)
+			gfile_free(lzo->out_buf);
+		if (lzo->block_buf)
+			gfile_free(lzo->block_buf);
+		gfile_free(lzo);
+	}
+	return 0;
+}
+
+static int
+lzo_file_open(gfile_t *fd)
+{
+	if (lzo_init() != LZO_E_OK)
+	{
+		gfile_printf_then_putc_newline("LZO: lzo_init() failed");
+		return 1;
+	}
+
+	if (!(fd->u.lzo = gfile_malloc(sizeof *fd->u.lzo)))
+	{
+		gfile_printf_then_putc_newline("Out of memory");
+		return 1;
+	}
+
+	memset(fd->u.lzo, 0, sizeof *fd->u.lzo);
+
+	fd->u.lzo->out_buf = gfile_malloc(LZO_OUTPUT_BUFFER_SIZE);
+	if (!fd->u.lzo->out_buf)
+	{
+		gfile_printf_then_putc_newline("LZO: out of memory for output buffer");
+		gfile_free(fd->u.lzo);
+		return 1;
+	}
+
+	fd->read = lzo_file_read;
+	fd->close = lzo_file_close;
+
+	return 0;
+}
+#endif
 #ifdef GPFXDIST
 /*
  * subprocess support
@@ -992,6 +1356,63 @@ static int close_filefd(int fd)
 	return ret;
 }
 
+#ifdef USE_LIBHDFS3
+/*
+ * HDFS URI parsing and connection
+ *
+ * URI format: hdfs://host:port/path
+ */
+static int
+hdfs_parse_uri(const char *uri, char *host, size_t host_sz,
+			   uint16_t *port, const char **path)
+{
+	const char *p;
+	const char *colon;
+	size_t hlen;
+
+	if (strncmp(uri, "hdfs://", 7) != 0)
+		return -1;
+
+	p = uri + 7;
+
+	colon = strchr(p, ':');
+	if (!colon)
+		return -1;
+
+	hlen = colon - p;
+	if (hlen == 0 || hlen >= host_sz)
+		return -1;
+
+	memcpy(host, p, hlen);
+	host[hlen] = '\0';
+
+	*port = (uint16_t)atoi(colon + 1);
+
+	*path = strchr(colon + 1, '/');
+	if (!*path)
+		return -1;
+
+	return 0;
+}
+
+static int
+hdfs_file_close(gfile_t *fd)
+{
+	if (fd->hdfs_file)
+	{
+		hdfsCloseFile(fd->hdfs_fs, fd->hdfs_file);
+		fd->hdfs_file = NULL;
+	}
+	if (fd->hdfs_fs)
+	{
+		hdfsDisconnect(fd->hdfs_fs);
+		fd->hdfs_fs = NULL;
+	}
+	fd->is_hdfs = FALSE;
+	return 0;
+}
+#endif
+
 /*
  * public interface
  */
@@ -1021,6 +1442,68 @@ int gfile_open(gfile_t* fd, const char* fpath, int flags, int* response_code, co
 #endif
 
 	memset(fd, 0, sizeof(*fd));
+
+#ifdef USE_LIBHDFS3
+	/*
+	 * Check for HDFS URI (hdfs://host:port/path)
+	 */
+	if (strncmp(fpath, "hdfs://", 7) == 0)
+	{
+		char host[256];
+		uint16_t port;
+		const char *hdfs_path;
+		hdfsFileInfo *info;
+
+		if (flags != GFILE_OPEN_FOR_READ)
+		{
+			gfile_printf_then_putc_newline("HDFS write not supported");
+			*response_code = 415;
+			*response_string = "HDFS write is not supported";
+			return 1;
+		}
+
+		if (hdfs_parse_uri(fpath, host, sizeof(host), &port, &hdfs_path) < 0)
+		{
+			gfile_printf_then_putc_newline("HDFS: invalid URI: %s", fpath);
+			*response_code = 400;
+			*response_string = "Invalid HDFS URI";
+			return 1;
+		}
+
+		fd->hdfs_fs = hdfsConnect(host, port);
+		if (!fd->hdfs_fs)
+		{
+			gfile_printf_then_putc_newline("HDFS: cannot connect to %s:%d", host, port);
+			*response_code = 500;
+			*response_string = "Cannot connect to HDFS";
+			return 1;
+		}
+
+		info = hdfsGetPathInfo(fd->hdfs_fs, hdfs_path);
+		if (info)
+		{
+			fd->compressed_size = info->mSize;
+			hdfsFreeFileInfo(info, 1);
+		}
+
+		fd->hdfs_file = hdfsOpenFile(fd->hdfs_fs, hdfs_path, O_RDONLY, 0, 0, 0);
+		if (!fd->hdfs_file)
+		{
+			gfile_printf_then_putc_newline("HDFS: cannot open file %s", hdfs_path);
+			hdfsDisconnect(fd->hdfs_fs);
+			fd->hdfs_fs = NULL;
+			*response_code = 404;
+			*response_string = "Cannot open HDFS file";
+			return 1;
+		}
+
+		fd->is_hdfs = TRUE;
+		fd->read = read_and_retry;
+		fd->close = hdfs_file_close;
+
+		goto setup_compression;
+	}
+#endif
 
 	/*
 	 * check for subprocess and/or named pipe
@@ -1254,6 +1737,11 @@ int gfile_open(gfile_t* fd, const char* fpath, int flags, int* response_code, co
 	}
 	else 
 #endif
+
+#ifdef USE_LIBHDFS3
+setup_compression:
+#endif
+
 	if (s && strcasecmp(s,".gz")==0)
 	{
 #ifndef HAVE_LIBZ
@@ -1298,6 +1786,18 @@ int gfile_open(gfile_t* fd, const char* fpath, int flags, int* response_code, co
 		return zstd_file_open(fd);
 #endif
 	}
+	else if (s && strcasecmp(s,".lzo")==0)
+	{
+#ifndef HAVE_LIBLZO2
+		gfile_printf_then_putc_newline(".lzo not supported");
+#else
+		fd->compression = LZO_COMPRESSION;
+		if (flags != GFILE_OPEN_FOR_READ)
+			gfile_printf_then_putc_newline(".lzo not yet supported for writable tables");
+
+		return lzo_file_open(fd);
+#endif
+	}
 	else if (s && strcasecmp(s,".z") == 0)
 		gfile_printf_then_putc_newline("gfile compression .z file is not supported");
 	else if (s && strcasecmp(s,".zip") == 0)
@@ -1330,11 +1830,19 @@ gfile_close(gfile_t*fd)
 			* for the compressed data implementation we need to call the "close" callback. Other implementations
 			* didn't use to call this callback here and it will remain so.
 			*/
-			if (fd->compression == GZ_COMPRESSION || fd->compression == ZSTD_COMPRESSION)
+			if (fd->compression == GZ_COMPRESSION || fd->compression == ZSTD_COMPRESSION
+				|| fd->compression == LZO_COMPRESSION)
 			{
 				fd->close(fd);
 			}
 
+#ifdef USE_LIBHDFS3
+			if (fd->is_hdfs)
+			{
+				hdfs_file_close(fd);
+			}
+			else
+#endif
 			if (fd->is_win_pipe)
 			{
 				fd->close(fd);

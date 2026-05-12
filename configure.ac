@@ -1357,6 +1357,22 @@ if test "$with_zstd" = yes; then
 fi
 
 #
+# lzo2 - for LZO/LZOP compression support in gpfdist
+#
+PGAC_ARG_BOOL(with, liblzo2, no,
+              [build with LZO2 support for gpfdist HDFS LZO file reading])
+AC_SUBST(with_liblzo2)
+
+#
+# libhdfs3 - for HDFS file access in gpfdist
+#
+AC_MSG_CHECKING([whether to build with libhdfs3 support])
+PGAC_ARG_BOOL(with, libhdfs3, no, [build with libhdfs3 support for HDFS access in gpfdist],
+              [AC_DEFINE([USE_LIBHDFS3], 1, [Define to build with libhdfs3 support. (--with-libhdfs3)])])
+AC_MSG_RESULT([$with_libhdfs3])
+AC_SUBST(with_libhdfs3)
+
+#
 # Realtime library
 #
 PGAC_ARG_BOOL(with, rt, yes,
@@ -1759,6 +1775,19 @@ if test "$with_libbz2" = yes ; then
   AC_CHECK_LIB(bz2, BZ2_bzDecompress, [], [AC_MSG_ERROR([library 'bz2' is required for bzip2 support])])
 fi
 
+# Check for lzo2
+if test "$with_liblzo2" = yes ; then
+  AC_CHECK_LIB(lzo2, lzo1x_decompress_safe, [],
+    [AC_MSG_ERROR([library 'lzo2' is required for LZO support])])
+  AC_DEFINE([HAVE_LIBLZO2], 1, [Define to 1 if you have the lzo2 library.])
+fi
+
+# Check for libhdfs3
+if test "$with_libhdfs3" = yes ; then
+  AC_CHECK_LIB(hdfs3, hdfsConnect, [],
+    [AC_MSG_ERROR([library 'hdfs3' is required for HDFS support])])
+fi
+
 if test "$with_libxslt" = yes ; then
   AC_CHECK_LIB(xslt, xsltCleanupGlobals, [], [AC_MSG_ERROR([library 'xslt' is required for XSLT support])])
 fi
@@ -1974,6 +2003,16 @@ fi
 # Check for bzlib.h
 if test "$with_libbz2" = yes ; then
   AC_CHECK_HEADER(bzlib.h, [], [AC_MSG_ERROR([header file <bzlib.h> is required for bzip2 support])], [])
+fi
+
+# Check for lzo/lzo1x.h
+if test "$with_liblzo2" = yes ; then
+  AC_CHECK_HEADER(lzo/lzo1x.h, [], [AC_MSG_ERROR([header file <lzo/lzo1x.h> is required for LZO support])], [])
+fi
+
+# Check for hdfs/hdfs.h
+if test "$with_libhdfs3" = yes ; then
+  AC_CHECK_HEADER(hdfs/hdfs.h, [], [AC_MSG_ERROR([header file <hdfs/hdfs.h> is required for HDFS support])], [])
 fi
 
 if test "$enable_external_fts" = yes; then

@@ -46,8 +46,42 @@ else ()
     message(FATAL_ERROR "zlib not found")
 endif(ZLIB_FOUND)
 
+# Optional LZO2 support
+option(WITH_LZO2 "Build with LZO2 compression support" OFF)
+if (WITH_LZO2)
+    find_library(LZO2_LIBRARY NAMES lzo2)
+    find_path(LZO2_INCLUDE_DIR lzo/lzo1x.h)
+    if (LZO2_LIBRARY AND LZO2_INCLUDE_DIR)
+        include_directories(${LZO2_INCLUDE_DIR})
+        add_definitions(-DHAVE_LIBLZO2)
+    else ()
+        message(FATAL_ERROR "lzo2 library not found")
+    endif ()
+endif ()
+
+# Optional libhdfs3 support
+option(WITH_LIBHDFS3 "Build with libhdfs3 HDFS access support" OFF)
+if (WITH_LIBHDFS3)
+    find_library(HDFS3_LIBRARY NAMES hdfs3)
+    find_path(HDFS3_INCLUDE_DIR hdfs/hdfs.h)
+    if (HDFS3_LIBRARY AND HDFS3_INCLUDE_DIR)
+        include_directories(${HDFS3_INCLUDE_DIR})
+        add_definitions(-DUSE_LIBHDFS3)
+    else ()
+        message(FATAL_ERROR "libhdfs3 library not found")
+    endif ()
+endif ()
+
 #set lib dirs
-target_link_libraries(gpfdist ${ZLIB_LIBRARIES} ${APR_LIB} ${EVENT_LIB} ${OPENSSL_LIBRARIES} libpgport ws2_32 Crypt32)
+set(GPFDIST_EXTRA_LIBS "")
+if (WITH_LZO2)
+    list(APPEND GPFDIST_EXTRA_LIBS ${LZO2_LIBRARY})
+endif ()
+if (WITH_LIBHDFS3)
+    list(APPEND GPFDIST_EXTRA_LIBS ${HDFS3_LIBRARY})
+endif ()
+
+target_link_libraries(gpfdist ${ZLIB_LIBRARIES} ${APR_LIB} ${EVENT_LIB} ${OPENSSL_LIBRARIES} libpgport ws2_32 Crypt32 ${GPFDIST_EXTRA_LIBS})
 
 set_target_properties(gpfdist PROPERTIES FOLDER bin)
 install(TARGETS gpfdist DESTINATION bin)
